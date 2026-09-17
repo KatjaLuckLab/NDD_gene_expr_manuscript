@@ -1,0 +1,185 @@
+---
+title: "Kaessmann Data - YARN - TissueSpecificity - V7"
+output:
+  html_document:
+      toc: TRUE
+      toc_float: TRUE
+      keep_md: FALSE
+---
+
+```{r setup, include=T, echo=T,error=F,warning=F,message=F}
+#######
+# Who: Siva
+# When: Jun 2023
+# What:
+# - Split the pre- and post- natal samples separately and then perform tissue-specific normalization
+# - Filtering of low expressed genes is also done based on the pre-post split set of samples.
+# - Merge the Forebrain and Hindbrain samples
+# - Remove testis and ovary
+# - preferential expression (TiP) calculated using Eqn. 4 and 5 of publication https://doi.org/10.1016/j.celrep.2017.10.001 - Two diff formula used;
+# - TiP4: 
+# - ((median of all pre-natal brain) - (median of all prenatal non-brain)/(IQR of all prenatal samples))
+#######
+
+knitr::opts_chunk$set(echo = F, cache = F, warning = F)
+options(stringsAsFactors = F)
+
+library(yarn)
+library(readr)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(reshape2)
+library(Biobase)
+library(kableExtra)
+library(data.table)
+library(stringr)
+library(ggrepel)
+library(multidplyr)
+
+```
+
+## Import raw read counts
+
+We import the read counts (.gct files) for all samples obtained (processing info in prologue). We want to prepare the data in a format suited for making it as an expression set object. 
+
+```{r import_raw, include=T, echo=T, error=F, warning=F, message=F}
+load("./kaessmann_raw_expSetObj.RData")
+```
+
+## The YARN pipeline
+
+### Filtering samples
+
+As we agreed in our initial meetings to remove testis from all analyses, I remove them from subsequent processing.
+We filter out genes from subsequent analysis which are low expressed (at least 1 read in half of the samples per tissue). 
+
+```{r yarn_filter, include=T, echo=T, error=F, warning=F, message=F}
+kaessmann_filteredouttestis = filterSamples(kaessmann_raw, ids = c("testis","ovary"), groups = "tissue")
+
+# We want to add additional metadata, categorizing samples into pre-vs-postnatal
+metadata_prevspost = as.data.frame(pData(kaessmann_filteredouttestis))
+metadata_prevspost$natalgroup = "Postnatal"
+metadata_prevspost[grepl("^[0-9]",metadata_prevspost$devstage),]$natalgroup = "Prenatal"
+
+# We merge the fore and hind brain as brain
+metadata_prevspost$tissue_original = metadata_prevspost$tissue
+metadata_prevspost[grepl("^fore",metadata_prevspost$tissue),]$tissue = "brain"
+metadata_prevspost[grepl("^hind",metadata_prevspost$tissue),]$tissue = "brain"
+
+# reassign to the exp. set object
+pData(kaessmann_filteredouttestis) = metadata_prevspost
+
+# split the pre and post natal samples
+kmann_prenatal = filterSamples(kaessmann_filteredouttestis, ids = "Postnatal", groups = "natalgroup")
+kmann_postnatal = filterSamples(kaessmann_filteredouttestis, ids = "Prenatal", groups = "natalgroup")
+
+# Perform the expression filter also in tissue level
+kmann_prenatal_filtered = filterLowGenes(kmann_prenatal, "tissue")
+kmann_postnatal_filtered = filterLowGenes(kmann_postnatal, "tissue")
+
+```
+
+The number of genes in our data set before and after filtering are `r dim(kaessmann_raw)[1]` and `r dim(kmann_prenatal_filtered)[1]`, `r dim(kmann_postnatal_filtered)[1]` in prenatal and postnatal respectively.
+
+### Tissue-Natal State aware normalization
+
+```{r yarn_denplot_after_norm, include=T, echo=T, error=F, warning=F, message=F}
+
+# Normalize
+kmann_prenatal_filtered <- normalizeTissueAware(kmann_prenatal_filtered,"tissue")
+kmann_postnatal_filtered <- normalizeTissueAware(kmann_postnatal_filtered,"tissue")
+
+# get required columns and join them from assayData and phenoData of the ExpressionSet object
+kmann_prenatal_filtered_normcount_meta_df <- assayData(kmann_prenatal_filtered)[["normalizedMatrix"]] %>% 
+                    as.data.frame() %>%
+                    rownames_to_column(., var = "gene_id") %>%
+                    pivot_longer(cols = -c("gene_id"), names_to = "SAMPID", values_to = "norm_count") %>%
+                    left_join(pData(kmann_prenatal_filtered) %>% 
+                                rownames_to_column("SAMPID") %>% 
+                                select(SAMPID,tissue,natalgroup), by="SAMPID")
+
+kmann_postnatal_filtered_normcount_meta_df <- assayData(kmann_postnatal_filtered)[["normalizedMatrix"]] %>% 
+                    as.data.frame() %>%
+                    rownames_to_column(., var = "gene_id") %>%
+                    pivot_longer(cols = -c("gene_id"), names_to = "SAMPID", values_to = "norm_count") %>%
+                    left_join(pData(kmann_postnatal_filtered) %>% 
+                                rownames_to_column("SAMPID") %>% 
+                                select(SAMPID,tissue,natalgroup), by="SAMPID")
+
+# we can save the normalized counts and sample info separately 
+# data is saved in long format which is easier to import and plot in R/python
+# let me know if you need in wide format (genes as rows, and samples as columns)
+
+write.table(kmann_prenatal_filtered_normcount_meta_df, file=gzfile("kmann_prenatal_filtered_normcount_tissue_info_brainmerged_v7.tsv.gz"), sep="\t", row.names = F, col.names = T, quote = F)
+write.table(kmann_postnatal_filtered_normcount_meta_df, file=gzfile("kmann_postnatal_filtered_normcount_tissue_info_brainmerged_v7.tsv.gz"), sep="\t", row.names = F, col.names = T, quote = F)
+```
+
+
+## TiP4: 
+
+For this version of tissue specific we calculate as follows:
+
+ * Reference group by natal state (i.e. median_all and iqr_all would encompass ALL samples from a specific natal state - as samples are already split based on natal state)
+ * TiP calculation for a gene in prenatal-brain would be as below, so that TiP values can be compared between pre- vs post-natal samples
+ * ((median of all pre-natal brain) - (median of all pre-natal non-brain samples)/(IQR of all pre-natal samples))
+
+```{r tip, include=T, echo=T, error=F, warning=F, message=F}
+
+# Let us write some functions which parallelizes the metrics calculations
+calc_metrics_and_save <- function(df, num_clusters=50, saveFileName="temp"){
+      cluster = new_cluster(num_clusters)
+      
+      #split the data-by gene
+      df_gene = df %>% 
+      group_by(gene_id) %>%
+      partition(cluster)
+
+      # gene-level metrics
+      gene_metrics=df_gene %>%
+      summarise(
+            iqr_all=IQR(norm_count)
+      )
+      gene_metrics = gene_metrics %>% collect()
+
+      #split the data-by gene and tissue
+      df_gene_tissue = df %>% 
+      group_by(gene_id, tissue) %>%
+      partition(cluster)
+
+      # copy df to another as we need it to calculate median_non_tissue
+      tmpdf = df
+      cluster_library(cluster,"dplyr")
+      cluster_library(cluster,"purrr")
+      cluster_copy(cluster,"tmpdf")
+      
+      gene_tissue_metrics = df_gene_tissue %>%
+      summarise(
+            median_tissue=median(norm_count),
+            median_nontissue=median(tmpdf$norm_count[tmpdf$gene_id == cur_group()$gene_id & tmpdf$tissue != cur_group()$tissue])
+      )
+      
+      gene_tissue_metrics = gene_tissue_metrics %>% collect()
+
+      rm(cluster)
+      gc()
+
+      # summarize and calc TiP4
+      metrics_df = gene_metrics %>% 
+      left_join(gene_tissue_metrics, by=c("gene_id"))
+
+      write.table(metrics_df, file=gzfile(paste0(saveFileName,"_metrics.tsv.gz")),sep="\t", row.names = F, col.names = T, quote = F)
+      
+      tip_metrics = metrics_df %>%
+      group_by(gene_id,tissue) %>%
+      summarise(tip4=(median_tissue-median_nontissue)/iqr_all)
+
+      write.table(tip_metrics, file=gzfile(paste0(saveFileName,"_TiP.tsv.gz")),sep="\t", row.names = F, col.names = T, quote = F)
+}
+
+calc_metrics_and_save(kmann_prenatal_filtered_normcount_meta_df, num_clusters=100, saveFileName="kmann_prenatal_filtered_brainmerged_v7")
+calc_metrics_and_save(kmann_postnatal_filtered_normcount_meta_df, num_clusters=100, saveFileName="kmann_postnatal_filtered_brainmerged_v7")
+
+```

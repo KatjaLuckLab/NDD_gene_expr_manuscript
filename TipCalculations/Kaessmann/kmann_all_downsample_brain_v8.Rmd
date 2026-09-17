@@ -1,0 +1,181 @@
+---
+title: "Downsample_Brain"
+author: "Sivarajan Karunanithi"
+date: "6/19/2023"
+output: html_document
+---
+
+```{r setup, include=T, echo=T,error=F,warning=F,message=F}
+
+#######
+# Who: Siva
+# When: Jun 2023
+# What:
+# - Used data from v7 - check for processing info there
+# - Removed ovary from pre-natal samples
+# - preferential expression (TiP) calculated using Eqn. 4 and 5 of publication https://doi.org/10.1016/j.celrep.2017.10.001 - Two diff formula used;
+# - We want to downsample the brain data as they are over represented in the kaessmann data set
+# - Sample X brain samples without replacement (X being average number of non-brain samples), and use that data set to calculate TiP4 for all tissues.
+# - I decided to do without replacement - as I wanted to keep the dataset balanced - with replacement might result in smaller proportion of brain samples and the repeat values are not going to affect the median and IQR
+# - Repeat the above step n=10 times
+# - Calculate Tip4 for each data set
+# - TiP4:
+# - ((median of all pre-natal brain) - (median of all prenatal non-brain)/(IQR of all prenatal samples))
+# - Calculate the mean Tip4 from the 10 different Tip4 values obtained
+#######
+
+library(yarn)
+library(readr)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(reshape2)
+library(Biobase)
+library(kableExtra)
+library(data.table)
+library(stringr)
+library(ggrepel)
+library(multidplyr)
+
+```
+
+## All Sample Sizes
+```{r kmann_actsize, include=T, echo=T,error=F,warning=F,message=F}
+# kmann meta
+load("./kmann_v6_brainmerged_natalstatefilterednormalized_expsetobj.RData")
+kmann_tissue_counts=pData(kaessmann_filtered) %>% filter(tissue!="ovary") %>% group_by(natalgroup,tissue) %>% count()
+rm(kaessmann_filtered)
+gc()
+
+print(kmann_tissue_counts)
+```
+
+For downsampling the brain tissues, we will use the average of prenatal and postnatal non-brain sample counts which are `r kmann_tissue_counts %>% filter(natalgroup=="Postnatal" & tissue != "brain") %>% ungroup() %>% select(n) %>% as.vector() %>% colMeans() %>% round(digits = 0)` and `r kmann_tissue_counts %>% filter(natalgroup=="Prenatal" & tissue != "brain") %>% ungroup() %>% select(n) %>% as.vector() %>% colMeans() %>% round(digits = 0)` respectively. 
+
+## Functions 
+
+```{r funcs, include=T, echo=T,error=F,warning=F,message=F}
+
+# functions
+calc_metrics <- function(df, num_clusters=3){
+      cluster = new_cluster(num_clusters)
+
+      #split the data-by gene
+      df_gene = df %>%
+      group_by(gene_id) %>%
+      partition(cluster)
+
+      # gene-level metrics
+      gene_metrics=df_gene %>%
+      summarise(
+            iqr_all=IQR(norm_count)
+      )
+      gene_metrics = gene_metrics %>% collect()
+
+      #split the data-by gene and tissue
+      df_gene_tissue = df %>%
+      group_by(gene_id, tissue) %>%
+      partition(cluster)
+
+      # copy df to another as we need it to calculate median_non_tissue
+      tmpdf = df
+      cluster_library(cluster,"dplyr")
+      cluster_library(cluster,"purrr")
+      cluster_copy(cluster,"tmpdf")
+
+      gene_tissue_metrics = df_gene_tissue %>%
+      summarise(
+            median_tissue=median(norm_count),
+            median_nontissue=median(tmpdf$norm_count[tmpdf$gene_id == cur_group()$gene_id & tmpdf$tissue != cur_group()$tissue])
+      )
+
+      gene_tissue_metrics = gene_tissue_metrics %>% collect()
+
+      # summarize and calc TiP4
+      metrics_df = gene_metrics %>%
+      left_join(gene_tissue_metrics, by=c("gene_id"))
+
+      tip_metrics = metrics_df %>%
+      group_by(gene_id,tissue) %>%
+      summarise(tip4=(median_tissue-median_nontissue)/iqr_all)
+
+      return(tip_metrics)
+
+}
+
+get_downsampled_data = function(sampids, df, tissue_to_downsample){
+  return(
+    df %>% 
+      filter(tissue!=tissue_to_downsample) %>% 
+      rbind(df %>% filter(tissue==tissue_to_downsample & SAMPID %in% sampids))
+  )
+}
+
+# Want to use the above approach to create randomly sampled data sets
+# As I create the random sampling based on sample names, and use those to subset the brain data.
+# Hence, the duplicate samples (in-effect the replace=TRUE) are removed. This would involve having lower number of brain samples than the rest.
+# This might become a problem resulting in under-representation of brain samples.
+# However, the median and IQR shouldn't be affected with or without the duplicate sample values
+# I checked it with some random values as well
+# x=rnorm(5) # I set a smaller number to match the downsampling size of our actual data
+# median(x)
+# median(rep(x,2))
+# median(rep(x,200))
+# median(rep(x,1e+4))
+# IQR(x)
+# IQR(rep(x,2))
+# IQR(rep(x,200))
+# IQR(rep(x,1e+4))
+
+# function to downsample and calculate tip metrics and tip4
+
+downsample_and_calc_metrics = function(input_tsv_gz_file, natalstate, tissue_to_downsample, NDD=FALSE, sampling_repeats=10, save_file_name="test", nproc=3) {
+
+        kmann=read.table(gzfile(input_tsv_gz_file), stringsAsFactors = FALSE, header = TRUE)
+        kmann_dstissue_samples_all = kmann %>% filter(tissue==tissue_to_downsample) %>% select(SAMPID) %>% distinct()
+        kmann_dstissue_downsampling_size = kmann_tissue_counts %>%
+                filter(natalgroup==natalstate & tissue != tissue_to_downsample) %>%
+                ungroup() %>%
+                select(n) %>%
+                as.vector() %>%
+                colMeans() %>%
+                round(digits = 0)
+
+        if(NDD){
+                ndd = read.table("./NDD_riskgeneids.txt", stringsAsFactors = F, header = TRUE)
+                kmann_ndd = kmann %>% filter(gene_id %in% c(ndd$gene_id))
+                kmann_to_process = kmann_ndd
+        } else {
+                kmann_to_process = kmann
+        }
+
+        num_repeats = sampling_repeats
+        set.seed(1234)
+        downsampled_sampids_n_times = 1:num_repeats %>%
+                purrr::map(~ sample(x=kmann_dstissue_samples_all$SAMPID, size=kmann_dstissue_downsampling_size, replace = FALSE))
+
+        downsampled_sampids_n_times_dfs=lapply(downsampled_sampids_n_times, function(x) { get_downsampled_data(x, kmann_to_process, tissue_to_downsample)} )
+
+        tip_n_times_list = lapply(c(1:num_repeats), function(x){ calc_metrics(downsampled_sampids_n_times_dfs[[x]], num_clusters=nproc) })
+        tip_n_times = purrr::reduce(tip_n_times_list, full_join, by=c("gene_id","tissue"))
+        tip_n_times = tip_n_times %>% rowwise() %>% mutate(mean_tip4=mean(c_across(starts_with("tip"))), median_tip4=median(c_across(starts_with("tip"))))
+
+	if(NDD){ save_to_file=paste0(save_file_name,"ndd_downsampled_TiPvalues.tsv.gz") } else { save_to_file=paste0(save_file_name,"_all_downsampled_TiPvalues.tsv.gz") }
+	if(NDD){ save_to_file_data=paste0(save_file_name,"ndd_downsampled_dfs.RData") } else { save_to_file_data=paste0(save_file_name,"_all_downsampled_dfs.RData") }
+
+        write.table(tip_n_times, file=gzfile(save_to_file),sep="\t", row.names = F, col.names = T, quote = F)
+	save(downsampled_sampids_n_times_dfs, file=save_to_file_data)
+}
+
+```
+
+## downsample
+
+```{r downsample, include=T, echo=T,error=F,warning=F,message=F}
+
+downsample_and_calc_metrics(input_tsv_gz_file="kmann_postnatal_filtered_normcount_tissue_info_brainmerged_v7.tsv.gz", natalstate="Postnatal", tissue_to_downsample="brain", NDD=FALSE, sampling_repeats=10, save_file_name="kmann_v8_postnatal", nproc=50)
+downsample_and_calc_metrics(input_tsv_gz_file="kmann_prenatal_filtered_normcount_tissue_info_brainmerged_v7.tsv.gz", natalstate="Prenatal", tissue_to_downsample="brain", NDD=FALSE, sampling_repeats=10, save_file_name="kmann_v8_prenatal", nproc=50)
+
+```

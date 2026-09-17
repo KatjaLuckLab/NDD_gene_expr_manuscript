@@ -1,0 +1,237 @@
+---
+title: "processGTExdata_YARN_TissueSpecificity_v2_All"
+output:
+  html_document:
+  toc: TRUE
+  toc_float: TRUE
+  keep_md: FALSE
+---
+
+```{r setup, include=T, echo=T,error=F,warning=F,message=F}
+#######
+# Who: Siva
+# When: Jan 2022
+# What:
+# - Load GTEx v8 data (raw; obtained from v1 folder)
+# - Filter out the testis, and cell derived samples (Cells - EBV-transformed lymphocytes; Cells - Cultured fibroblasts)
+# - Merge the tissue sub-locations for the selected ones (see below for details)
+# - Filter low expressed genes
+# - apply YARN normalization for the sub-tissue
+# - preferential expression calculated using Eqn. 4 and 5 of publication https://doi.org/10.1016/j.celrep.2017.10.001
+# - calculate preferential expression 
+#######
+
+knitr::opts_chunk$set(echo = F, 
+                      cache = F, 
+                      warning = F)
+options(stringsAsFactors = F)
+
+library(yarn)
+library(readr)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(reshape2)
+
+```
+
+## Import raw and filter data
+
+We import the raw gtex data from the v1 and filter out the cell derived samples namely Cells - EBV-transformed lymphocytes, Cells - Cultured fibroblasts.
+
+```{r prepData, include=T, echo=T, error=F, warning=F, message=F}
+# Just check if pre-processed gtex data exists and load it if available
+gtex_raw_no_cells_file_name <- paste0("gtex_raw_no_cells_expSetObj.RData")
+if(!file.exists(gtex_raw_no_cells_file_name)){
+  load("../v1/gtex_raw_expSetObj.RData")
+  # remove the cell derived samples and Testis
+  gtex_raw_no_cells <- filterSamples(gtex_raw, ids = c("Cells - EBV-transformed lymphocytes", "Cells - Cultured fibroblasts", "Testis"), groups = "SMTSD", keepOnly =  FALSE)
+  
+  save(gtex_raw_no_cells, file = gtex_raw_no_cells_file_name)
+} else {
+  load(gtex_raw_no_cells_file_name)
+}
+
+# remove original file and free up mem
+rm(gtex_raw)
+gc()
+```
+
+## Create different groupings of sub-tissue locations
+
+We create the following groups of sub-tissues which were identified based on the v1 analysis (refer to Tissue sub-locations section of the v1 report). The tissues which are not mentioned below did not have sub tissue locations or we did not identify useful clusters in the v1 analysis.  
+
+ * Adipose tissue (2: subcutaneous, visceral); 
+ * Blood vessel (3: Aorta, coronary, tibial); 
+ * Brain (3: Cerebellum, Basal ganglia, Others);
+ * Colon (2: sigmoid, transverse); 
+ * Esophagus (2: mucosa, muscularis + gastroesophagal junction); 
+ * Heart (2: left ventricle; atrial appendage); 
+ * Kidney (2: cortex; medulla); 
+ * Skin (1: Not sun exposed + sun exposed);
+
+For the ease of processing and trackability let us create one additional column named SMTSD_New (for the grouping)  in the phenoData slot of the expression set object; SMTSD column already has the info of all the sub-sampling sites.
+
+```{r create_subgroupings, include=T, echo=T, error=F, warning=F, message=F}
+gtex_raw_no_cells$SMTSD_New <- gtex_raw_no_cells$SMTSD
+
+# adipose tissue, blood vessel, colon, and heart already have the groupings as we intend to have.
+
+# We merge the cerebellum and cerebellar hemisphere samples
+# We merge the caudate, accumbens, and putamen of basal ganglia as one group
+# we merge the rest of the brain sub-tissues as others
+pData(gtex_raw_no_cells)[grep("brain",pData(gtex_raw_no_cells)$SMTSD, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Brain - Others"
+pData(gtex_raw_no_cells)[grep("cerebell",pData(gtex_raw_no_cells)$SMTSD, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Brain - Cerebellum"
+pData(gtex_raw_no_cells)[grep("basal ganglia",pData(gtex_raw_no_cells)$SMTSD, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Brain - Basal ganglia"
+
+# we merge cervix as one tissue
+pData(gtex_raw_no_cells)[grep("cervix",pData(gtex_raw_no_cells)$SMTSD_New, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Cervix Uteri"
+
+# we merge in Esophagus muscularis and gastroesophagal junction as gastroesophageal junction
+pData(gtex_raw_no_cells)[grep("muscularis",pData(gtex_raw_no_cells)$SMTSD_New, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Esophagus - Gastroesophageal Junction"
+
+# we merge kidney as one tissue
+pData(gtex_raw_no_cells)[grep("kidney",pData(gtex_raw_no_cells)$SMTSD_New, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Kidney"
+
+# we merge skin as one tissue
+pData(gtex_raw_no_cells)[grep("skin",pData(gtex_raw_no_cells)$SMTSD_New, ignore.case = TRUE, fixed = FALSE),]$SMTSD_New <- "Skin"
+
+```
+
+## Filtering low expressed genes
+
+We filter out genes from subsequent analysis which are low expressed (at least 1 read in half of the samples per tissue).
+
+
+```{r filter_genes_S3, include=T, echo=T, error=F, warning=F, message=F}
+gtex_filtered <- filterLowGenes(gtex_raw_no_cells, "SMTSD_New")
+
+```
+
+The number of genes in our dataset before and after filtering are `r dim(gtex_raw_no_cells)[1]` and `r dim(gtex_filtered)[1]`. 
+
+## Normalization
+
+We can perform the tissue aware normalization. Using the plots shown below, we can observe the effect of normalization on all the samples. 
+
+```{r normalize_genes_S3, include=T, echo=T, error=F, warning=F, message=F}
+plotDensity(gtex_filtered, "SMTSD_New", main=expression('log'[2]*' raw expression'),
+             xlab="Read count", ylab="Density")
+gtex_filtered <- normalizeTissueAware(gtex_filtered,"SMTSD_New")
+plotDensity(gtex_filtered, "SMTSD_New", normalized=TRUE, main="Normalized - All tissue subgroups", xlab="Read count", ylab="Density")
+```
+
+## Calculating specificity score
+
+We extract here the required normalized count matrix and the associated sample metadata (a.k.a phenoData), specifically sample id and the tissue name.
+
+```{r calc_specificity_S3, include=T, echo=T, error=F, warning=F, message=F}
+
+# get required columns and join them from assayData and phenoData of the ExpressionSet object
+gtex_filtered_normcount_meta_df <- assayData(gtex_filtered)[["normalizedMatrix"]] %>% 
+					as.data.frame() %>%
+					rownames_to_column(., var = "gene_id") %>%
+					pivot_longer(cols = -c("gene_id"), names_to = "SAMPID", values_to = "norm_count") %>%
+					left_join(pData(gtex_filtered) %>% 
+							select(SAMPID,SMTSD_New), by="SAMPID")
+
+# we can save the normalized counts and sample info separately 
+# data is saved in long format which is easier to import and plot in R/python
+# let me know if you need in wide format (genes as rows, and samples as columns)
+
+# commenting out below statements as it produces a rather huge file and this may not be needed
+
+# write.table(gtex_filtered_normcount_meta_df, file="gtex_all_tissue_subgroups_filtered_normcount_tissue_info.tsv", 
+#	    sep="\t", row.names = F, col.names = T, quote = F)
+
+# In this step, we calculate the tissue specific medians; all tissues medians; 
+# inter-quartile range of all tissues; and the calculate the specificity score
+gtex_filtered_norm_specificity_info <- gtex_filtered_normcount_meta_df %>%
+					group_by(gene_id) %>%
+					summarise(median_all=median(norm_count), iqr_all=IQR(norm_count)) %>%
+					left_join(gtex_filtered_normcount_meta_df %>%
+						  group_by(gene_id,SMTSD_New) %>%
+						  summarise(median_tissue=median(norm_count)), by="gene_id") %>%
+					mutate(specificity_score=round((median_tissue-median_all)/iqr_all,2))
+
+
+# we can now save these data as tables
+
+write.table(gtex_filtered_norm_specificity_info, file="gtex_all_tissue_subgroups_filtered_norm_specificity_info.tsv", 
+	    sep="\t", row.names = F, col.names = T, quote = F)
+```
+
+## Distribution of specificity score
+
+Let us now take a look at the distribution of the specificity score. 
+
+```{r distro_specificity_S3, include=T, echo=T, error=F, warning=F, message=F}
+
+# basic summary of specificity scores; if there is no infinity found, we can be happy that we did not end up with a zero IQR value
+
+print(summary(gtex_filtered_norm_specificity_info$specificity_score))
+
+ggplot(gtex_filtered_norm_specificity_info, aes(specificity_score))+
+	geom_histogram()+
+	theme_bw()+
+	labs(title="Specificity score distribution - All tissue subgroups", x="Specificity score", y="Count")
+
+```
+
+Next, let us have a look at the number of genes specific in at least one tissue for different specificity cut-offs (1 to 3 with a step size of 0.25). 
+
+
+```{r distro_specificity_counts_S3, include=T, echo=T, error=F, warning=F, message=F}
+
+n_genes_specificity_score_cuts_tissue_subgroups <- data.frame(sp_cut_off=c(seq(1,3,0.25)), 
+					  tissue_subgroups=sapply(c(seq(1,3,0.25)), function(x) { 
+								  	  gtex_filtered_norm_specificity_info %>% 
+									  	filter(specificity_score > x) %>%
+									        select(gene_id) %>%	
+									  	n_distinct() }
+					  )
+					  )
+
+print(n_genes_specificity_score_cuts_tissue_subgroups)
+
+n_genes_specificity_score_cuts_tissue_subgroups %>% 
+	pivot_longer(-c(sp_cut_off),names_to = "type", values_to = "count") %>% 
+	ggplot(aes(x=sp_cut_off, y=count)) + 
+		geom_bar(stat="identity", position="dodge") + 
+		theme_bw()+
+		labs(x="Specificity score cut-offs", y="# of distinct genes higher than the cut-off")
+
+```
+
+## Multiplicity of the tissue specific genes
+
+We can get in how many tissues each gene is found to be specific. A boxplot (and a histogram) of the distribution of the mulitiplicity values is also shown, just to get an idea of how often are genes found to specific for multiple tissues. For these calculations, I have used a specificity cut-off of 2. 
+
+```{r multiplicity_counts_S3, include=T, echo=T, error=F, warning=F, message=F}
+
+gene_multiplicity_tissue_subgroups <- gtex_filtered_norm_specificity_info %>% filter(specificity_score > 2) %>% count(gene_id)
+
+write.table(gene_multiplicity_tissue_subgroups, file="gtex_all_tissue_subgroups_specificity_2_filtered_gene_multiplicty.tsv", 
+	    sep="\t", row.names = F, col.names = T, quote = F)
+
+gene_multiplicity_tissue_subgroups %>%
+	ggplot(aes("", n)) +
+	geom_boxplot() +
+	theme_bw() + 
+	labs(x="Distribution", y="Multiplicity", title="Multiplicity distribution - All tissue subgroups")
+
+gene_multiplicity_tissue_subgroups %>%
+	ggplot(aes(n)) +
+	geom_histogram() +
+	theme_bw() +
+	labs(x="Multiplicity", y="Number of genes with such multiplicity", title="All tissue subgroups" )
+
+```
+
+## Saving the filtered data
+
+```{r save_all_S3, include=T, echo=T, error=F, warning=F, message=F}
+save(gtex_filtered, file="gtex_all_tissue_subgroups_filtered_normalized_expsetobj.RData")
+```

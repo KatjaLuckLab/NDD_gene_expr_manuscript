@@ -1,0 +1,448 @@
+---
+title: "Kaessmann Data - YARN - TissueSpecificity"
+output:
+  html_document:
+      toc: TRUE
+      toc_float: TRUE
+      keep_md: FALSE
+---
+
+```{r setup, include=T, echo=T,error=F,warning=F,message=F}
+#######
+# Who: Siva
+# When: Apr 2022
+# What:
+# - Get processed (by Siva to match GTEx v8) kaessmann data, apply YARN package steps (except sex misidentification)
+# - obtain qsmooth normalized counts (clever way of doing quantile normalization)
+# - calculate and return normalized expression values (genes x tissues) and preferential expression values
+# - preferential expression calculated using Eqn. 4 and 5 of publication https://doi.org/10.1016/j.celrep.2017.10.001
+# -
+#######
+
+knitr::opts_chunk$set(echo = F, cache = F, warning = F)
+options(stringsAsFactors = F)
+
+library(yarn)
+library(readr)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(reshape2)
+library(Biobase)
+library(kableExtra)
+library(data.table)
+library(stringr)
+library(ggrepel)
+
+```
+
+## TL;DR Summary
+
+ * The Kaessmann data contains in total 313 samples from various tissues in diverse developmental stages. I started from the raw fastq files and obtained read counts using the same workflow followed in GTEx v8. 
+ * I have removed the testis samples from all downstream analysis after capturing the basic statistics and visualizing them in the MDS plots. 
+ * Most of the tissues group together well in each developmental stage, except in the pre-natal samples where the fore- and hindbrain differences are rather small. However, this is maybe expected?!
+ * When checking how the developmental stages group in each tissue, we can see a clear separation of pre- and post- natal samples. 
+ * After filtering low expressed genes which does not have at least 1 read in half of the samples per tissue, we have about 22000 genes left for downstream analysis.
+ * The number of tissue specific genes identified are around 4800 with default grouping (just the respective tissues). Further I grouped the samples based on pre- and post- natal stages which increases the number of tissue specific genes to approx. 5300 and 6200 respectively.  
+ * One possible downstream analysis would be to perhaps question which genes are expressed specifically in different devstage in each tissue. We could think about leveraging the same equation we use to calculate tissue specificity (median_tissue-median_all/iqr_all), and just change to perhaps median_devstage-median_alldevstages/iqr_alldevstages. We may have to re-group the devstages a bit differently to have a handful of samples in each devstage.
+ 
+## Raw data processing
+
+The Kaessmann data contains samples from [Human RNA-seq time-series](https://www.nature.com/articles/s41586-019-1338-5) of the development of seven major organs (brain, cerebellum, heart, kidney, liver, ovary and testis) from 4 weeks post conception to adulthood (including ageing). 
+
+ * The data is accessible from EBI with [E-MTAB-6814](https://www.ebi.ac.uk/arrayexpress/experiments/E-MTAB-6814/). 
+ * The authors provide only the RPKM and CPM values. As we need the raw counts, I obtained the raw fastq files from the associated [meta data files](https://www.ebi.ac.uk/arrayexpress/files/E-MTAB-6814/E-MTAB-6814.sdrf.txt). 
+ * Fastq files were downloaded and subjected quality control (FastQC/MultiQC), alignment (STAR v2.7.3a), quantification (RNA-SeQC v2.4.2)
+ * Worth noting is that: GTEx used the bit outdated STAR aligner v2.5.3a and RNA-SeQC v1.1.9. Although, I used a different RNA-SeQC version, which is much faster in processing, the tool has a legacy mode which performed the counting exactly as in the older RNA-SeQC v1.1.9. 
+ * For quantification and alignment I matched the genome annotation versions similar to GTEx v8 processing (GRCh38; Gencode v26). Additionally, I also created a collapsed gene model as performed in GTEx using the [gtex scripts](https://github.com/broadinstitute/gtex-pipeline/tree/master/gene_model) - essentially they remove overlapping intervals of genes, and remove transcripts which are annotated as retained introns. 
+ * We obtained the raw read counts from all Kaessmann samples as .gct files, which we will process here.
+
+## Basic statistics from meta data
+
+Let us import the meta data first, which I had edited out from the associated [meta data files](https://www.ebi.ac.uk/arrayexpress/files/E-MTAB-6814/E-MTAB-6814.sdrf.txt) and create some basic statistics from the 313 samples sourced from various tissues in diverse developmental stages.
+
+Abbreviation used: wpc - weeks post conception
+
+```{r metadata_stats, include=T, echo=T, error=F, warning=F, message=F}
+metadata = fread("/project/data/kaessmann_devstage/E-MTAB-6814.sdrf_extracted_metadata", 
+                 header = F, col.names = c("sampid","tissue","sex","devstage","sampname"))
+
+# I assume we are not diving into sex differences, so I did not group them based on sex
+
+tissue_stage_summary = metadata %>%
+  group_by(devstage, tissue) %>%
+  count() %>%
+  arrange(devstage) %>%
+  pivot_wider(names_from = tissue, values_from = n, values_fill=0 )
+
+kable(tissue_stage_summary, format="html", align=c("c")) %>%
+  kable_styling() %>%
+  kableExtra::scroll_box(width = "100%", height = "300px")
+```
+
+## Import raw read counts
+
+We import the read counts (.gct files) for all samples obtained (processing info in prologue). We want to prepare the data in a format suited for making it as an expression set object. 
+
+```{r import_raw, include=T, echo=T, error=F, warning=F, message=F}
+
+gct_files_path = "/project/recounts/kaessmann_devstage/results/RNA-SeQC"
+
+# We start with the path where all the RNA-SeQC quantified files are located
+gct_all_data = gct_files_path %>%
+  
+  # we need only the gene_reads.gct files which is imported as list
+  list.files(pattern = "*.bam.gene_reads.gct", full.names = T) %>%
+  
+  # we set the sample names extracted from the filename as the name of each file in the list
+  set_names(gsub(lcSuffix(basename(.)),"",basename(.))) %>%
+  
+  # several things happen here
+  # map_dfr loops all the files in the list and binds every read (the fread function) data frame by row
+  # the .id will create a new column called sampid, filled with the names() of the list of files we are processing - which was set in the previous step with the set_names() to contain only the sample id
+  map_dfr(fread, col.names=c("gene_id","gene_name","counts"), .id = "sampid") %>%
+  
+  # we just make a wide data format so that the samples are on columns and geneids are on rows
+  pivot_wider(names_from = sampid, values_from = counts) %>%
+  
+  # we do not need the gene_name as this will be part of the meta data in the expression set object
+  select(-gene_name) %>%
+  
+  # we remove the gene_ids with _PAR_Y, as they are pseudoautosomal regions of Y which are not included in gtex data
+  filter(!str_detect(gene_id, "_PAR_Y$")) %>%
+  
+  # we do not want the versioning of the gene id
+  mutate(gene_id=sub("\\..*", "", gene_id)) %>%
+  
+  # we  move the gene_id as row names which is need for the expression set object created
+  column_to_rownames("gene_id")
+
+```
+
+## Create an ExpressionSet object
+
+As we know, we need three data frames to create an expression set object. 
+
+ * a matrix of read counts - rows corresponding to genes and columns corresponding to samples
+ * metadata for genes - information like gene name, length, etc.
+ * metadata for samples - info like tissue, age, sex, etc.
+
+```{r create_raw, include=T, echo=T, error=F, warning=F, message=F}
+
+# we already have the read counts matrix prepared in the way we need it
+
+# The metadata of samples need to be adjusted
+# just by converting the sampid column as the rownames
+
+metadata_samples = metadata %>% 
+  # the sampid ordering should match how it is in the expression matrix
+  arrange(sampid) %>%
+  column_to_rownames("sampid")
+
+# We create an expressionset object
+kaessmann_raw = ExpressionSet(assayData = as.matrix(gct_all_data),
+                                phenoData = new("AnnotatedDataFrame", data=metadata_samples))
+
+# The metadata of genes can be obtained from public resources
+# Use the annotation respective to GTEx v8
+# which uses GRCh38/hg38 with gencode v26 annotation
+# according to gencode v26 website releases info GRCh38.p10 (freeze date: Mar2017)
+# is the associated data
+
+host = "mar2017.archive.ensembl.org"
+biomart = "ENSEMBL_MART_ENSEMBL"
+dataset = "hsapiens_gene_ensembl"
+attributes = c("ensembl_gene_id", "hgnc_symbol", "chromosome_name",
+                "start_position", "end_position", "gene_biotype")
+genes = unlist(rownames(gct_all_data))
+
+kaessmann_raw <- annotateFromBiomart(obj = kaessmann_raw, genes = genes, host = host,
+                            biomart = biomart, dataset = dataset, attributes = attributes)
+
+save(kaessmann_raw, file="./kaessmann_raw_expSetObj.RData")
+
+```
+
+## The YARN pipeline
+
+### Tissue Groupings
+
+The below plots show how the different tissue samples group in each developmental stage. Most of the tissues group together well, except in the pre-natal samples the fore- and hindbrain differences are rather small. However, this is maybe expected. 
+
+```{r yarn_tissuemerge, include=T, echo=T, error=F, warning=F, message=F}
+mdsmat_devstage = checkTissuesToMerge(kaessmann_raw, "devstage", "tissue", plotFlag = FALSE)
+
+# First we need to name the elements of the list of mds coordinates with the respective devstage names
+
+names(mdsmat_devstage) = metadata %>% 
+  group_by(devstage) %>% 
+  count() %>% 
+  select(devstage) %>% 
+  unlist(use.names = FALSE)
+
+# Next we prepare all the additional data we need alongside the mds coordinates for each sample, namely, the age and brain sub-tissue information
+
+mdsmat_devstage=lapply(mdsmat_devstage, function(x) { 
+  as.data.frame(x) %>% 
+    rownames_to_column() %>% 
+    left_join(pData(kaessmann_raw) %>% 
+                select(tissue) %>% 
+                rownames_to_column()
+              )
+  })
+
+lapply(names(mdsmat_devstage), function(x) { 
+  ggplot(mdsmat_devstage[[x]], aes(V1,V2, color=tissue)) + 
+    geom_point(size=3) + 
+    theme_classic() + 
+    scale_color_viridis_d() + 
+    geom_text_repel(mapping = aes(V1,V2, label=tissue), color="black") +
+    labs(x="MDS component: 1", y="MDS component: 2", title = x) +
+    guides(color=guide_legend(title="Tissue"))
+  }
+  )
+```
+
+### Developmental stages - Check for merging
+
+The below plots show how the different developmental stages group in each tissue. 
+
+```{r yarn_tissuemerge_stage, include=T, echo=T, error=F, warning=F, message=F}
+mdsmat_tissue = checkTissuesToMerge(kaessmann_raw, "tissue", "devstage", plotFlag = FALSE)
+
+# First we need to name the elements of the list of mds coordinates with the respective devstage names
+
+names(mdsmat_tissue) = metadata %>% 
+  group_by(tissue) %>% 
+  count() %>% 
+  select(tissue) %>% 
+  unlist(use.names = FALSE)
+
+# Next we prepare all the additional data we need alongside the mds coordinates for each sample, namely, the age and brain sub-tissue information
+
+mdsmat_tissue=lapply(mdsmat_tissue, function(x) { 
+  as.data.frame(x) %>% 
+    rownames_to_column() %>% 
+    left_join(pData(kaessmann_raw) %>% 
+                select(devstage) %>% 
+                rownames_to_column()
+              )
+  })
+
+lapply(names(mdsmat_tissue), function(x) { 
+  ggplot(mdsmat_tissue[[x]], aes(V1,V2, color=devstage)) + 
+    geom_point(size=3) + 
+    theme_classic() + 
+    scale_color_viridis_d() + 
+    geom_text_repel(mapping = aes(V1,V2, label=devstage), color="black") +
+    labs(x="MDS component: 1", y="MDS component: 2", title = x) +
+    guides(color=guide_legend(title="Developmental Stage"))
+  }
+  )
+```
+
+In line with our earlier discussion on the Brain Span data, we can see two broad groups emerge from the MDS plots: pre-natal vs post-natal. In this document, I'll create tissue specificity values 
+ * with out considering any sub-groups, but just tissues and
+ * pre vs post-natal grouping of tissues. 
+
+### Filtering Testis samples
+
+As we agreed in our initial meetings to remove testis from all analyses, I remove them from subsequent processing.
+
+```{r yarn_filter_testis, include=T, echo=T, error=F, warning=F, message=F}
+kaessmann_filteredouttestis = filterSamples(kaessmann_raw, ids = "testis", groups = "tissue")
+```
+
+### Filtering low expressed genes
+
+We filter out genes from subsequent analysis which are low expressed (at least 1 read in half of the samples per tissue).
+
+```{r yarn_filter, include=T, echo=T, error=F, warning=F, message=F}
+kaessmann_filtered = filterLowGenes(kaessmann_filteredouttestis, "tissue")
+```
+
+The number of genes in our dataset before and after filtering are `r dim(kaessmann_raw)[1]` and `r dim(kaessmann_filtered)[1]`.
+
+### Tissue aware normalization
+
+The density plots below shows the effect of normalization.
+
+```{r yarn_denplot_before_norm, include=T, echo=T, error=F, warning=F, message=F}
+
+plotDensity(kaessmann_filtered, "tissue", main=expression('log'[2]*' raw expression'),
+             xlab="Read count", ylab="Density")
+```
+
+```{r yarn_denplot_after_norm, include=T, echo=T, error=F, warning=F, message=F}
+
+kaessmann_filtered <- normalizeTissueAware(kaessmann_filtered,"tissue")
+plotDensity(kaessmann_filtered, "tissue", normalized=TRUE, main="Normalized - Original grouping", xlab="Read count", ylab="Density")
+```
+
+## Tissue specificity
+
+```{r tissue_sp_score, include=T, echo=T, error=F, warning=F, message=F}
+
+# get required columns and join them from assayData and phenoData of the ExpressionSet object
+kaessmann_filtered_normcount_meta_df <- assayData(kaessmann_filtered)[["normalizedMatrix"]] %>% 
+                    as.data.frame() %>%
+                    rownames_to_column(., var = "gene_id") %>%
+                    pivot_longer(cols = -c("gene_id"), names_to = "SAMPID", values_to = "norm_count") %>%
+                    left_join(pData(kaessmann_filtered) %>% 
+                                rownames_to_column("SAMPID") %>% 
+                                select(SAMPID,tissue), by="SAMPID")
+
+# we can save the normalized counts and sample info separately 
+# data is saved in long format which is easier to import and plot in R/python
+# let me know if you need in wide format (genes as rows, and samples as columns)
+
+write.table(kaessmann_filtered_normcount_meta_df, file=gzfile("kmann_filtered_tissuegrouping_normcount_tissue_info.tsv.gz"),
+      sep="\t", row.names = F, col.names = T, quote = F)
+
+# In this step, we calculate the tissue specific medians; all tissues medians; 
+# inter-quartile range of all tissues; and the calculate the specificity score
+kaessmann_filtered_norm_specificity_info <- kaessmann_filtered_normcount_meta_df %>%
+                    group_by(gene_id) %>%
+                    summarise(median_all=median(norm_count), iqr_all=IQR(norm_count)) %>%
+                    left_join(kaessmann_filtered_normcount_meta_df %>%
+                          group_by(gene_id,tissue) %>%
+                          summarise(median_tissue=median(norm_count)), by="gene_id") %>%
+                    mutate(specificity_score=round((median_tissue-median_all)/iqr_all,2))
+
+
+# we can now save these data as tables
+
+write.table(kaessmann_filtered_norm_specificity_info, file=gzfile("kmann_filtered_tissuegrouping_norm_specificity_info.tsv.gz"), 
+        sep="\t", row.names = F, col.names = T, quote = F)
+
+```
+
+### Distribution of specificity score
+
+Let us now take a look at the distribution of the specificity score.
+
+```{r distro, include=T, echo=T, error=F, warning=F, message=F}
+
+# basic summary of specificity scores; if there is no infinity found, we can be happy that we did not end up with a zero IQR value
+print(summary(kaessmann_filtered_norm_specificity_info$specificity_score))
+```
+
+### Tissue specific genes - various cut offs 
+
+Next, let us have a look at the number of genes specific in at least one tissue for different specificity cut-offs (1 to 3 with a step size of 0.25).
+
+```{r distro2, include=T, echo=T, error=F, warning=F, message=F}
+
+n_genes_specificity_score_cuts_tissue_subgroups <- data.frame(sp_cut_off=c(seq(1,3,0.25)), 
+                      tissue_subgroups=sapply(c(seq(1,3,0.25)), function(x) { 
+                                      kaessmann_filtered_norm_specificity_info %>% 
+                                        filter(specificity_score > x) %>%
+                                            select(gene_id) %>% 
+                                        n_distinct() }
+                      )
+                      )
+
+print(n_genes_specificity_score_cuts_tissue_subgroups)
+
+n_genes_specificity_score_cuts_tissue_subgroups %>% 
+    pivot_longer(-c(sp_cut_off),names_to = "type", values_to = "count") %>% 
+    ggplot(aes(x=sp_cut_off, y=count)) + 
+        geom_bar(stat="identity", position="dodge") + 
+        theme_bw()+
+        labs(x="Specificity score cut-offs", y="# of distinct genes higher than the cut-off")
+
+```
+
+## Tissue Specificity - pre vs post natal grouping
+
+We calculate the tissue specificity values by considering samples only in the respective pre- or post-natal groups. Additionally, the distribution of the specificity score and the number of genes specific in at least one tissue for different specificity cut-offs provided is also grouped according to the pre- or post-natal group. 
+
+```{r tissue_sp_score-pre vs post, include=T, echo=T, error=F, warning=F, message=F}
+
+# Just extract the phenoData and add a new column grouping the dev stages in to pre- vs postnatal
+# we just check by the devstage column if it starts with a number and assign it to pre-natal
+metadata_prevspost = as.data.frame(pData(kaessmann_filtered))
+metadata_prevspost$natalgroup = "Postnatal"
+metadata_prevspost[grepl("^[0-9]",metadata_prevspost$devstage),]$natalgroup = "Prenatal"
+# reassign to the exp. set object
+pData(kaessmann_filtered) = metadata_prevspost
+
+# get required columns and join them from assayData and phenoData of the ExpressionSet object
+# we have now added the natal group column to the output as well
+kaessmann_filtered_normcount_meta_df_pvp <- assayData(kaessmann_filtered)[["normalizedMatrix"]] %>% 
+                    as.data.frame() %>%
+                    rownames_to_column(., var = "gene_id") %>%
+                    pivot_longer(cols = -c("gene_id"), names_to = "SAMPID", values_to = "norm_count") %>%
+                    left_join(pData(kaessmann_filtered) %>% 
+                                rownames_to_column("SAMPID") %>% 
+                                select(SAMPID,tissue,natalgroup), by="SAMPID")
+
+# In this step, we calculate the tissue specific medians; all tissues medians; 
+# inter-quartile range of all tissues; and the calculate the specificity score
+# Note that here: "all" and "tissue" contains only the samples from the corresponding natal group category
+kaessmann_filtered_norm_specificity_info_pvp <- kaessmann_filtered_normcount_meta_df_pvp %>%
+                    group_by(gene_id,natalgroup) %>%
+                    summarise(median_all=median(norm_count), iqr_all=IQR(norm_count)) %>%
+                    left_join(kaessmann_filtered_normcount_meta_df_pvp %>%
+                          group_by(gene_id,tissue,natalgroup) %>%
+                          summarise(median_tissue=median(norm_count)), by=c("gene_id","natalgroup")) %>%
+                    mutate(specificity_score=round((median_tissue-median_all)/iqr_all,2))
+
+
+# we can now save these data as tables
+
+write.table(kaessmann_filtered_norm_specificity_info_pvp, file=gzfile("kmann_filtered_tissuegrouping_norm_specificity_info_pre_vs_postnatal.tsv.gz"), 
+        sep="\t", row.names = F, col.names = T, quote = F)
+```
+
+### Distribution of specificity score
+
+Let us now take a look at the distribution of the specificity score.
+
+```{r distro_pvp, include=T, echo=T, error=F, warning=F, message=F}
+
+# basic summary of specificity scores; if there is no infinity found, we can be happy that we did not end up with a zero IQR value
+
+# Pre-natal only
+print(summary(kaessmann_filtered_norm_specificity_info_pvp[which(kaessmann_filtered_norm_specificity_info_pvp$natalgroup=="Prenatal"),]$specificity_score))
+
+# Post-natal only
+print(summary(kaessmann_filtered_norm_specificity_info_pvp[which(kaessmann_filtered_norm_specificity_info_pvp$natalgroup=="Postnatal"),]$specificity_score))
+
+```
+
+### Tissue specific genes - various cut offs 
+
+```{r distro2_pvp, include=T, echo=T, error=F, warning=F, message=F}
+
+n_genes_specificity_score_cuts_tissue_subgroups_pvp <- data.frame(sp_cut_off=c(seq(1,3,0.25)), 
+                      tissue_prenatal=sapply(c(seq(1,3,0.25)), function(x) { 
+                                      kaessmann_filtered_norm_specificity_info_pvp %>% 
+                                        filter(specificity_score > x, natalgroup == "Prenatal") %>%
+                                            select(gene_id,) %>% 
+                                        n_distinct() }
+                      ),
+                      tissue_postnatal=sapply(c(seq(1,3,0.25)), function(x) { 
+                                      kaessmann_filtered_norm_specificity_info_pvp %>% 
+                                        filter(specificity_score > x, natalgroup == "Postnatal") %>%
+                                            select(gene_id,) %>% 
+                                        n_distinct() }
+                      )
+                      )
+
+print(n_genes_specificity_score_cuts_tissue_subgroups_pvp)
+
+n_genes_specificity_score_cuts_tissue_subgroups_pvp %>% 
+    pivot_longer(-c(sp_cut_off),names_to = "type", values_to = "count") %>% 
+    ggplot(aes(x=sp_cut_off, y=count, fill=type)) + 
+        geom_bar(stat="identity", position="dodge") + 
+        theme_bw()+
+        labs(x="Specificity score cut-offs", y="# of distinct genes higher than the cut-off")
+```
+
+## Saving the filtered data
+```{r save, include=T, echo=T, error=F, warning=F, message=F}
+save(kaessmann_filtered, file="kaessmann_lowexp_and_testis_filtered_original_grouping_normalized_expsetobj.RData")
+```

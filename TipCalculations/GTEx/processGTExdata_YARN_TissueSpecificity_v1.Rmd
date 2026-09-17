@@ -1,0 +1,369 @@
+---
+title: "processGTExdata_YARN_TissueSpecificity"
+output: 
+  html_document:
+    toc: TRUE
+    toc_float: TRUE
+    keep_md: FALSE
+---
+
+```{r setup, include=T, echo=T,error=F,warning=F,message=F}
+#######
+# Who: Siva
+# When: Dec 2021
+# What:
+# - Get GTEx v8 data, apply YARN package steps (except sex misidentification)
+# - obtain qsmooth normalized counts (clever way of doing quantile normalization)
+# - calculate and return normalized expression values (genes x tissues) and preferential expression values
+# - preferential expression calculated using Eqn. 4 and 5 of publication https://doi.org/10.1016/j.celrep.2017.10.001
+# - Katja advises to remove Testis from preferential expression calculation; 
+#   as it biases analysis as identified in previous work (check publication: https://doi.org/10.1038/s41586-020-2188-x)
+# - 
+#######
+
+knitr::opts_chunk$set(echo = F,
+                      cache = F,
+                      warning = F)
+options(stringsAsFactors = F)
+
+library(yarn)
+library(readr)
+library(tibble)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(reshape2)
+library(Biobase)
+
+```
+
+## Import GTEx data as an ExpressionSet object
+
+One can use the downloadGTEx function from yarn package if we need the GTEx v6 data. 
+
+As we want to use the GTEx v8 data; the downloadGTEx function is slightly edited below to take a GCT.gz, and required phenotype information files as input. Additionally, the link to biomart repository was also changed to the respective version associated with GTEx v8.  
+
+```{r prepGTExData, include=T, echo=T, error=F, warning=F, message=F}
+
+# Just check if pre-processed gtex data exists and load it if available
+gtex_file_name <- paste0("gtex_raw_expSetObj.RData")
+
+if(!file.exists(gtex_file_name)){
+  prepareGTEx <- function(attributeFile, phenotypeFile, rawCountFile, type = "genes") {
+  
+  # function parameters are changed to take files at runtime
+  
+  # Below commented lines are my edits
+  
+  # phenoFile <- "http://www.gtexportal.org/static/datasets/gtex_analysis_v6/annotations/GTEx_Data_V6_Annotations_SampleAttributesDS.txt"
+  # pheno2File <- "http://www.gtexportal.org/static/datasets/gtex_analysis_v6/annotations/GTEx_Data_V6_Annotations_SubjectPhenotypesDS.txt"
+  # geneFile <- "http://www.gtexportal.org/static/datasets/gtex_analysis_v6/rna_seq_data/GTEx_Analysis_v6_RNA-seq_RNA-SeQCv1.1.8_gene_reads.gct.gz"
+  
+  phenoFile <- attributeFile
+  pheno2File <- phenotypeFile
+  geneFile <- rawCountFile
+  
+  # phenoFile <- "/project/data/gtex/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt"
+  # pheno2File <- "/project/data/gtex/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt"
+  # geneFile <- "/project/data/gtex/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
+
+  # message("Downloading and reading files")
+  # pdFile <- tempfile("phenodat", fileext = ".txt")
+  # download(phenoFile, destfile = pdFile)
+  # pd <- read_tsv(pdFile)
+  
+  pd <- read_tsv(phenoFile)
+  pd <- as.matrix(pd)
+  rownames(pd) <- pd[, "SAMPID"]
+  ids <- sapply(strsplit(pd[, "SAMPID"], "-"), function(i) paste(i[1:2],
+                                                                 collapse = "-"))
+
+  # pd2File <- tempfile("phenodat2", fileext = ".txt")
+  # download(pheno2File, destfile = pd2File)
+  # pd2 <- read_tsv(pd2File)
+  
+  pd2 <- read_tsv(pheno2File)
+  pd2 <- as.matrix(pd2)
+  rownames(pd2) <- pd2[, "SUBJID"]
+  pd2 <- pd2[which(rownames(pd2) %in% unique(ids)), ]
+  pd2 <- pd2[match(ids, rownames(pd2)), ]
+  rownames(pd2) <- colnames(counts)
+
+  pdfinal <- AnnotatedDataFrame(data.frame(cbind(pd, pd2)))
+
+  if (type == "genes") {
+    # countsFile <- tempfile("counts", fileext = ".gz")
+    # download(geneFile, destfile = countsFile)
+    
+    # added the below line, as R complained that default size of 131072 was not enough
+    Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 4)
+    cnts <- suppressWarnings(read_tsv(geneFile, skip = 2))
+    
+    genes <- unlist(cnts[, 1])
+    geneNames <- unlist(cnts[, 2])
+    counts <- cnts[, -c(1:2)]
+    counts <- as.matrix(counts)
+    rownames(counts) <- genes
+    for (i in 1:nrow(problems(cnts))) {
+      counts[problems(cnts)$row[i], problems(cnts)$col[i]] <- 1e+05
+    }
+    throwAway <- which(rowSums(counts) == 0)
+    counts <- counts[-throwAway, ]
+    # added to remove the version number in Ensembl genes
+    genes <- sub("\\..*", "", rownames(counts))
+    rownames(counts) <- genes
+    
+    # Change the annotation respective to GTEx v8
+    # which uses GRCh38/hg38 with gencode v26 annotation
+    # according to gencode v26 website releases info GRCh38.p10 (freeze date: Mar2017)
+    # is the associated data
+
+    host <- "mar2017.archive.ensembl.org"
+    biomart <- "ENSEMBL_MART_ENSEMBL"
+    dataset <- "hsapiens_gene_ensembl"
+    attributes <- c("ensembl_gene_id", "hgnc_symbol", "chromosome_name",
+                    "start_position", "end_position", "gene_biotype")
+  }
+
+  message("Creating ExpressionSet")
+  pdfinal <- pdfinal[match(colnames(counts), rownames(pdfinal)),]
+  
+  # I modified the object name to be the same one to use through out the script
+  gtex_raw <- ExpressionSet(as.matrix(counts))
+  phenoData(gtex_raw) <- pdfinal
+  # The below statements are commented, as these samples were not available in the GTEx v8 data set
+  # pData(es)["GTEX-YF7O-2326-101833-SM-5CVN9", "SMTS"] <- "Skin"
+  # pData(es)["GTEX-YEC3-1426-101806-SM-5PNXX", "SMTS"] <- "Stomach"
+
+  message("Annotating from biomaRt")
+  gtex_raw <- annotateFromBiomart(obj = gtex_raw, genes = genes, host = host,
+                            biomart = biomart, dataset = dataset, attributes = attributes)
+
+  # message("Cleaning up files")
+  # unlink(pdFile)
+  # unlink(pd2File)
+  # unlink(countsFile)
+
+  # if (!is.null(file))
+  #   saveRDS(es, file = file)
+  save(gtex_raw, file=gtex_file_name)
+  return(gtex_raw)
+}
+
+# Now we can get the data
+
+gtex_raw <- prepareGTEx(
+  "/project/data/gtex/GTEx_Analysis_v8_Annotations_SampleAttributesDS.txt",
+  "/project/data/gtex/GTEx_Analysis_v8_Annotations_SubjectPhenotypesDS.txt",
+  "/project/data/gtex/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_reads.gct.gz"
+)
+} else {
+  load(gtex_file_name)
+}
+```
+
+## Applying the YARN pipeline
+
+### Sex misidentification
+
+I apply in this section, the entire YARN pipeline step-by-step, using the GTEx v8 data. We decided not to use the sex misidentification step, as it is not important for our analysis. Nevertheless, for the sake of completion I have included below the multi-dimensional scaling plot (MDS; will also be used in the next section) produced using prinicipal coordinate analysis (PCoA). The main difference to more famous principle component analysis (PCA) is that this method *does not* capture the variance. These plots uses euclidean distance measure between samples (it is a way to calculate dissimilarity between samples) and returns a set of points such that the distances between the points are approximately equal to the dissimilarities. We will use these type of plots also on the next subsection.
+
+```{r mis_sex, include=T, echo=T, error=F, warning=F, message=F}
+
+checkMisAnnotation(gtex_raw, "SEX", controlGenes = "Y", legendPosition = "topleft")
+```
+
+### Tissue sub-locations
+
+These are MDS plots as well. However, here the samples are colored using the sampling location of each sample in each tissue. In general (since we focus our analysis at the tissue level), most tissues (and their sub-locations) are quite homogeneous, meaning they get separated quite nicely, except Brain. 
+
+We may need to think about two of the following: 
+
+ * Should we analyse some brain sub-locations separately?
+ * Should we leave out some sub-locations in any sample?
+ * In particular, perhaps, it is a good idea to remove the samples (from sub-locations) which forms a perfectly separate cluster. For example, the cell-derived blood and skin.
+
+```{r tissue_merges, include=T, echo=T, error=F, warning=F, message=F}
+checkTissuesToMerge(gtex_raw, "SMTS", "SMTSD", plotFlag = TRUE, legendPosition = "topleft")
+```
+
+### Filtering low expressed genes
+
+Depending on the decisions we make for the above section, we need to re-run the below steps. 
+
+We filter out genes from subsequent analysis which are low expressed (at least 1 read in half of the samples per tissue).
+
+
+```{r filter_genes, include=T, echo=T, error=F, warning=F, message=F}
+gtex_filtered=filterLowGenes(gtex_raw, "SMTS")
+```
+The number of genes in our dataset before and after filtering are `r dim(gtex_raw)[1]` and `r dim(gtex_filtered)[1]`. 
+
+### Normalization
+
+We can perform the tissue aware normalization. Using the plots shown below, we can observe the effect of normalization on all the samples. As a quick reminder, this is essentially a quantile normalization (forcing the distribution of samples to be the same), but one which retains the tissue level differences. 
+
+
+```{r normalize_genes, include=T, echo=T, error=F, warning=F, message=F}
+plotDensity(gtex_filtered,"SMTS",main=expression('log'[2]*' raw expression'))
+gtex_filtered = normalizeTissueAware(gtex_filtered,"SMTS")
+plotDensity(gtex_filtered,"SMTS",normalized=TRUE,main="Normalized")
+```
+
+## Calculating specificity score as defined in Sonawane et. al. (Cell Reports 21)
+
+We extract here the required normalized count matrix and the associated sample metadata (a.k.a phenoData), specifically sample id and the tissue name.
+
+```{r calc_specificity, include=T, echo=T, error=F, warning=F, message=F}
+
+# get required columns and join them from assaData and phenoData of the ExpressionSet object
+gtex_filtered_normcount_meta_df <- assayData(gtex_filtered)[["normalizedMatrix"]] %>% 
+					as.data.frame() %>%
+					rownames_to_column(., var = "gene_id") %>%
+					pivot_longer(cols = -c("gene_id"), names_to = "SAMPID", values_to = "norm_count") %>%
+					left_join(pData(gtex_filtered) %>% 
+							select(SAMPID,SMTS), by="SAMPID")
+
+# we can now remove the testis samples
+gtex_filtered_normcount_meta_df_woTestis <- gtex_filtered_normcount_meta_df %>% 
+						filter(!SMTS %in% c("Testis"))
+
+# we can save the normalized counts and sample info separately 
+# data is saved in long format which is easier to import and plot in R/python
+# let me know if you need in wide format (genes as rows, and samples as columns)
+
+# commenting out below statements as it produces a rather huge file and this may not be needed
+
+# write.table(gtex_filtered_normcount_meta_df, file="gtex_filtered_normcount_tissue_info.tsv", 
+#	    sep="\t", row.names = F, col.names = T, quote = F)
+
+# write.table(gtex_filtered_normcount_meta_df_woTestis, file="gtex_filtered_normcount_tissue_info_woTestis.tsv", 
+#	    sep="\t", row.names = F, col.names = T, quote = F)
+
+# In this step, we calculate the tissue specific medians; all tissues medians; 
+# inter-quartile range of all tissues; and the calculate the specificity score
+gtex_filtered_norm_specificity_info <- gtex_filtered_normcount_meta_df %>%
+					group_by(gene_id) %>%
+					summarise(median_all=median(norm_count), iqr_all=IQR(norm_count)) %>%
+					left_join(gtex_filtered_normcount_meta_df %>%
+						  group_by(gene_id,SMTS) %>%
+						  summarise(median_tissue=median(norm_count)), by="gene_id") %>%
+					mutate(specificity_score=round((median_tissue-median_all)/iqr_all,2))
+
+gtex_filtered_norm_specificity_info_woTestis <- gtex_filtered_normcount_meta_df_woTestis %>%
+					group_by(gene_id) %>%
+					summarise(median_all=median(norm_count), iqr_all=IQR(norm_count)) %>%
+					left_join(gtex_filtered_normcount_meta_df_woTestis %>%
+						  group_by(gene_id,SMTS) %>%
+						  summarise(median_tissue=median(norm_count)), by="gene_id") %>%
+					mutate(specificity_score=round((median_tissue-median_all)/iqr_all,2))
+
+# we can now save these data as tables
+write.table(gtex_filtered_norm_specificity_info_woTestis, file="gtex_filtered_norm_specificity_info_woTestis.tsv", 
+	    sep="\t", row.names = F, col.names = T, quote = F)
+
+write.table(gtex_filtered_norm_specificity_info, file="gtex_filtered_norm_specificity_info.tsv", 
+	    sep="\t", row.names = F, col.names = T, quote = F)
+```
+
+## Distribution of specificity score
+
+Let us now take a look at the distribution of the specificity score. First we can see a simple boxplot of the distribution of the specificity scores: with and with out testis.
+
+```{r distro_specificity, include=T, echo=T, error=F, warning=F, message=F}
+
+# basic summary of specificity scores; if there is no infinity found, we can be happy that we did not end up with a zero IQR value
+
+print(summary(gtex_filtered_norm_specificity_info$specificity_score))
+
+ggplot(gtex_filtered_norm_specificity_info, aes(specificity_score))+
+	geom_histogram()+
+	theme_bw()+
+	labs(title="Specificity score distribution - with testis", x="Specificity score", y="Count")
+
+print(summary(gtex_filtered_norm_specificity_info_woTestis$specificity_score))
+
+ggplot(gtex_filtered_norm_specificity_info_woTestis, aes(specificity_score))+
+	geom_histogram()+
+	theme_bw()+
+	labs(title="Specificity score distribution - with out testis", x="Specificity score", y="Count")
+
+```
+
+Next, let us have a look at the number of genes specific in at least one tissue for different specificity cut-offs (1 to 3 with a step size of 0.25). 
+
+
+```{r distro_specificity_counts, include=T, echo=T, error=F, warning=F, message=F}
+
+n_genes_specificity_score_cuts <- data.frame(sp_cut_off=c(seq(1,3,0.25)), 
+					  wTestis=sapply(c(seq(1,3,0.25)), function(x) { 
+								  	  gtex_filtered_norm_specificity_info %>% 
+									  	filter(specificity_score > x) %>%
+									        select(gene_id) %>%	
+									  	n_distinct() }
+					  ),
+					  woTestis=sapply(c(seq(1,3,0.25)), function(x) {
+									  gtex_filtered_norm_specificity_info_woTestis %>%
+										  filter(specificity_score > x) %>%
+										  select(gene_id) %>%
+										  n_distinct() }
+					  )
+					  )
+
+print(n_genes_specificity_score_cuts)
+
+n_genes_specificity_score_cuts %>% 
+	pivot_longer(-c(sp_cut_off),names_to = "type", values_to = "count") %>% 
+	ggplot(aes(x=sp_cut_off, y=count, fill=type)) + 
+		geom_bar(stat="identity", position="dodge") + 
+		theme_bw()+
+		labs(x="Specificity score cut-offs", y="# of distinct genes higher than the cut-off")
+
+```
+
+## Multiplicity of the tissue specific genes
+
+We can get in how many tissues each gene is found to be specific. A boxplot (and a histogram) of the distribution of the mulitiplicty values is also shown, just to get an idea of how often are genes found to specific for multiple tissues. For these calculations, I have used a specificity cut-off of 2. 
+
+```{r multiplicity_counts, include=T, echo=T, error=F, warning=F, message=F}
+gene_multiplicity_woTestis <- gtex_filtered_norm_specificity_info_woTestis %>% filter(specificity_score > 2) %>% count(gene_id)
+gene_multiplicity <- gtex_filtered_norm_specificity_info %>% filter(specificity_score > 2) %>% count(gene_id)
+
+write.table(gene_multiplicity, file="gtex_specificity_2_filtered_gene_multiplicty.tsv", 
+	    sep="\t", row.names = F, col.names = T, quote = F)
+
+write.table(gene_multiplicity_woTestis, file="gtex_specificity_2_filtered_gene_multiplicity_woTestis.tsv", 
+	    sep="\t", row.names = F, col.names = T, quote = F)
+
+gene_multiplicity %>%
+	ggplot(aes("", n)) +
+	geom_boxplot() +
+	theme_bw() + 
+	labs(x="Distribution", y="Multiplicity", title="Multiplicity distribution - with Testis")
+
+gene_multiplicity %>%
+	ggplot(aes(n)) +
+	geom_histogram() +
+	theme_bw() +
+	labs(x="Multiplicity", y="Number of genes with such multiplicity", title="with Testis" )
+
+gene_multiplicity_woTestis %>%
+	ggplot(aes("", n)) +
+	geom_boxplot() +
+	theme_bw() + 
+	labs(x="Distribution", y="Multiplicity", title="Multiplicity distribution - with out Testis")
+
+gene_multiplicity_woTestis %>%
+	ggplot(aes(n)) +
+	geom_histogram() +
+	theme_bw() +
+	labs(x="Multiplicity", y="Number of genes with such multiplicity", title="with out Testis" )
+```
+## Saving the session with all objects
+
+Well, enough said ;) 
+
+```{r save_all, include=T, echo=T, error=F, warning=F, message=F}
+save(gtex_filtered, file="gtex_filtered_normalized_expsetobj.RData")
+```

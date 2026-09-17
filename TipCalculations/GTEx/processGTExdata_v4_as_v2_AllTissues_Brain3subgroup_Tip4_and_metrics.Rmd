@@ -1,0 +1,94 @@
+---
+title: "TiP_v4_3_Brain"
+output:
+  html_document:
+  toc: TRUE
+  toc_float: TRUE
+  keep_md: FALSE
+---
+
+```{r setup, include=T, echo=T,error=F,warning=F,message=F}
+#######
+# Who: Siva
+# When: Jun 2023
+# What:
+# - Load GTEx v8 data (processed; obtained from v2 folder - Brain Split in 3 groups) - Same as v2
+# - Tip4 = (median_tissue - median_non_tissue)/iqr_all_tissues 
+#######
+
+knitr::opts_chunk$set(echo = F, 
+                      cache = F, 
+                      warning = F)
+options(stringsAsFactors = F)
+
+library(multidplyr)
+library(dplyr)
+library(purrr)
+
+```
+
+## Load Normalized Data - From v2 Brain-grouped as 3
+
+
+```{r normalize_genes_S3, include=T, echo=T, error=F, warning=F, message=F}
+# load the normalized data
+
+# get required columns and join them from assayData and phenoData of the ExpressionSet object
+#gtex_filtered_normcount_meta_df = read.table(file=gzfile("./gtex_v3_as_v2_AllTissueSubgroups_Brain1subgroup_normcounts_meta_df.tsv.gz"), header=TRUE, sep="\t", stringsAsFactors=FALSE, colClasses=c(rep("character",2),"numeric","character"), nrows=489848740) 
+gtex_filtered_normcount_meta_df = read.table(file=gzfile("./gtex_all_tissue_subgroups_filtered_normcount_tissue_info_noSAMPID.tsv.gz"), header=TRUE, sep="\t", stringsAsFactors=FALSE, colClasses=c("character","numeric","character")) 
+
+tmpdf = gtex_filtered_normcount_meta_df
+
+# We create a cluster and let the calculations run in parallel
+cluster = new_cluster(80)
+data_gene=gtex_filtered_normcount_meta_df %>%
+  group_by(gene_id) %>%
+  partition(cluster)
+
+gene_metrics=data_gene %>%
+  summarise(
+            median_all=median(norm_count),
+            iqr_all=IQR(norm_count)
+            )
+gene_metrics = gene_metrics %>% collect()
+write.table(gene_metrics, file=gzfile("gtex_all_tissues_brain3_filtered_norm_v4_genemetrics.tsv.gz"),sep="\t", row.names = F, col.names = T, quote = F)
+
+data_gene_tissue=gtex_filtered_normcount_meta_df %>%
+  group_by(gene_id,SMTSD_New) %>%
+  partition(cluster)
+
+cluster_library(cluster,"dplyr")
+cluster_library(cluster,"purrr")
+cluster_copy(cluster,"tmpdf")
+
+gene_tissue_metrics = data_gene_tissue %>%
+	summarise(
+	    median_tissue=median(norm_count),
+	    median_nontissue=median(tmpdf$norm_count[tmpdf$gene_id == cur_group()$gene_id & tmpdf$SMTSD_New != cur_group()$SMTSD_New])
+  	)
+
+gene_tissue_metrics = gene_tissue_metrics %>% collect()
+write.table(gene_tissue_metrics, file=gzfile("gtex_all_tissues_brain3_filtered_norm_v4_genetissuemetrics.tsv.gz"),sep="\t", row.names = F, col.names = T, quote = F)
+
+rm(cluster)
+gc()
+
+summary_metrics_df=gene_metrics %>% 
+  left_join(gene_tissue_metrics, by=c("gene_id"))
+
+# data is saved in long format which is easier to import and plot in R/python with which TiP values can be calcuated later depending on the method we decide to use
+
+write.table(summary_metrics_df, file=gzfile("gtex_all_tissues_brain3_filtered_norm_v4_summarymetrics.tsv.gz"),sep="\t", row.names = F, col.names = T, quote = F)
+
+# What are the different tip variants
+# Tip4 = median_tissue - median_nontissue / iqr_all
+
+tip_variants = summary_metrics_df %>%
+        group_by(gene_id,SMTSD_New) %>%
+        summarise(
+                  tip4=(median_tissue-median_nontissue)/iqr_all
+	)
+
+
+write.table(tip_variants, file=gzfile("gtex_all_tissues_brain3_filtered_norm_v4_TiPVariants.tsv.gz"),sep="\t", row.names = F, col.names = T, quote = F)
+```
